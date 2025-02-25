@@ -35,11 +35,66 @@ class FetchThread(QThread):
             print(f"Error fetching repo.json: {e}")
             self.fetched.emit([])
 
+class CloneThread(QThread):
+    """Thread to handle repository cloning."""
+    finished = pyqtSignal(bool, str)  # Signal to indicate cloning status and message
+
+    def __init__(self, repo_url, clone_path):
+        super().__init__()
+        self.repo_url = repo_url
+        self.clone_path = clone_path
+
+    def run(self):
+        try:
+            subprocess.run(["git", "clone", self.repo_url, str(self.clone_path)], check=True)
+            self.finished.emit(True, "Cloning completed.")
+        except subprocess.CalledProcessError as e:
+            self.finished.emit(False, f"Failed to clone repository: {e}")
+
+class CompileThread(QThread):
+    """Thread to handle sketch compilation."""
+    finished = pyqtSignal(bool, str)  # Signal to indicate compilation status and message
+
+    def __init__(self, sketch_path, build_flags, build_path, compile_path):
+        super().__init__()
+        self.sketch_path = sketch_path
+        self.build_flags = build_flags
+        self.build_path = build_path
+        self.compile_path = compile_path
+
+    def run(self):
+        try:
+            result = subprocess.run(
+                [ARDUINO_CLI, "compile", "--fqbn", ARDUINO_BOARD, "--build-path", str(self.build_path), *self.build_flags, str(self.compile_path)],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
+            # Locate the compiled binary (matches Arduino IDE naming)
+            sketch_name = self.compile_path.name
+            compiled_binary = self.build_path / f"{sketch_name}.ino.hex"
+            if not compiled_binary.exists():
+                hex_files = list(self.build_path.glob("*.hex"))
+                if hex_files:
+                    compiled_binary = hex_files[0]
+                else:
+                    self.finished.emit(False, "No .hex file found in build directory.")
+                    return
+
+            self.finished.emit(True, str(compiled_binary))
+        except subprocess.CalledProcessError as e:
+            self.finished.emit(False, f"Failed to compile sketch: {e}\nOutput:\n{e.stdout}\nError:\n{e.stderr}")
+
 class ArduboyManager(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Arduboy Sketch Manager")
+        self.setWindowTitle("Arduboy ReComp")
         self.setGeometry(100, 100, 800, 600)
+
+        # Set window icon
+        icon_path = self.resource_path("arduboy_icon.ico")  # Use resource_path to locate the icon
+        self.setWindowIcon(QIcon(icon_path))
 
         # Main layout
         self.central_widget = QWidget()
@@ -94,8 +149,24 @@ class ArduboyManager(QMainWindow):
         self.compile_button.clicked.connect(self.compile_sketch)
         self.layout.addWidget(self.compile_button)
 
+        # Status label
+        self.status_label = QLabel("", self)
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setStyleSheet("font-weight: bold; color: blue;")
+        self.layout.addWidget(self.status_label)
+
         # Data
         self.sketches = []
+
+    def resource_path(self, relative_path):
+        """Get the absolute path to a resource, works for development and for PyInstaller."""
+        try:
+            # PyInstaller creates a temp folder and stores path in _MEIPASS
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+
+        return os.path.join(base_path, relative_path)
 
     def fetch_sketches(self):
         """Fetch sketches from the repo.json file."""
@@ -174,51 +245,60 @@ class ArduboyManager(QMainWindow):
             QMessageBox.warning(self, "Error", "No source URL found for this sketch.")
             return
 
+        # Show "Cloning..." message immediately
+        self.status_label.setText("Cloning...")
+
         # Clone and compile the sketch
         clone_path = Path("temp_clone")
         if clone_path.exists():
             shutil.rmtree(clone_path, onerror=self.handle_remove_readonly)
-    
-        if not self.clone_repository(source_url, clone_path):
-            QMessageBox.warning(self, "Error", "Failed to clone repository.")
+
+        # Start the cloning thread
+        self.clone_thread = CloneThread(source_url, clone_path)
+        self.clone_thread.finished.connect(self.handle_clone_finished)
+        self.clone_thread.start()
+
+    def handle_clone_finished(self, success, message):
+        """Handle the result of the cloning thread."""
+        if not success:
+            QMessageBox.warning(self, "Error", message)
+            self.status_label.setText("")  # Clear the status message
             return
 
-        # Search for the sketch file in subdirectories
-        sketch_path = self.find_sketch_file(clone_path)
-        if sketch_path:
-            sketch_path = self.rename_sketch_file(sketch_path)
+        # Show "Compiling..." message
+        self.status_label.setText("Compiling...")
 
-        # Always compile in clone_path
-        compile_path = clone_path
+        # Search for the sketch file in subdirectories
+        sketch_path = self.find_sketch_file(Path("temp_clone"))
+        if not sketch_path:
+            QMessageBox.warning(self, "Error", "No sketch file found in the repository.")
+            self.status_label.setText("")  # Clear the status message
+            return
+
+        # Rename the sketch file to match its parent folder if necessary
+        sketch_path = self.rename_sketch_file(sketch_path)
+
+        # Compile in the sketch's directory
+        compile_path = sketch_path.parent  # Set compile_path to the folder containing the .ino file
         build_path = compile_path / "build"
         build_path.mkdir(exist_ok=True)
 
-        # Compile using arduino-cli with explicit build path
+        # Generate build flags
         build_flags = self.get_build_flags()
-        try:
-            result = subprocess.run(
-                [ARDUINO_CLI, "compile", "--fqbn", ARDUINO_BOARD, "--build-path", str(build_path), *build_flags, str(compile_path)],
-                check=True,
-                capture_output=True,
-                text=True
-            )
 
-            # Locate the compiled binary (matches Arduino IDE naming)
-            sketch_name = compile_path.name
-            compiled_binary = build_path / f"{sketch_name}.ino.hex"
-            if not compiled_binary.exists():
-                hex_files = list(build_path.glob("*.hex"))
-                if hex_files:
-                    compiled_binary = hex_files[0]
-                else:
-                    QMessageBox.warning(self, "Error", "No .hex file found in build directory.")
-                    return
+        # Start the compilation thread
+        self.compile_thread = CompileThread(sketch_path, build_flags, build_path, compile_path)
+        self.compile_thread.finished.connect(self.handle_compile_finished)
+        self.compile_thread.start()
 
-            # Automatically prompt to save the binary after successful compilation
+    def handle_compile_finished(self, success, message):
+        """Handle the result of the compilation thread."""
+        if success:
+            compiled_binary = Path(message)
             self.export_binary(compiled_binary)
-            
-        except subprocess.CalledProcessError as e:
-            QMessageBox.warning(self, "Error", f"Failed to compile sketch: {e}\nOutput:\n{e.stdout}\nError:\n{e.stderr}")
+        else:
+            QMessageBox.warning(self, "Error", message)
+        self.status_label.setText("")  # Clear the status message
 
     def export_binary(self, compiled_binary):
         """Export the compiled binary."""
@@ -261,14 +341,22 @@ class ArduboyManager(QMainWindow):
 
     def find_sketch_file(self, directory):
         """Search for a sketch file containing setup() and loop()."""
+        print(f"Searching for sketch in: {directory}")  # Debug print
         for root, _, files in os.walk(directory):
             for file in files:
                 if file.endswith(".ino"):
                     sketch_path = Path(root) / file
-                    with open(sketch_path, "r", encoding="utf-8") as f:
-                        content = f.read().lower()  # Case-insensitive search
-                        if "void setup()" in content and "void loop()" in content:
-                            return sketch_path
+                    print(f"Checking file: {sketch_path}")  # Debug print
+                    try:
+                        with open(sketch_path, "r", encoding="utf-8") as f:
+                            content = f.read().lower()  # Case-insensitive search
+                            # Look for "setup(" and "loop(" instead of "setup()" and "loop()"
+                            if "setup(" in content and "loop(" in content:
+                                print(f"Found sketch: {sketch_path}")  # Debug print
+                                return sketch_path
+                    except Exception as e:
+                        print(f"Error reading {sketch_path}: {e}")  # Debug print
+        print("No sketch file found.")  # Debug print
         return None
 
     def rename_sketch_file(self, sketch_path):
