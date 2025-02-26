@@ -93,7 +93,7 @@ class ArduboyManager(QMainWindow):
         self.setGeometry(100, 100, 800, 600)
 
         # Set window icon
-        icon_path = self.resource_path("arduboy_icon.ico")  # Use resource_path to locate the icon
+        icon_path = self.resource_path("arduboy_icon.ico")
         self.setWindowIcon(QIcon(icon_path))
 
         # Main layout
@@ -141,13 +141,20 @@ class ArduboyManager(QMainWindow):
         self.layout.addLayout(self.settings_panel)
 
         # Buttons
+        button_layout = QHBoxLayout()
         self.fetch_button = QPushButton("Fetch Sketches", self)
         self.fetch_button.clicked.connect(self.fetch_sketches)
-        self.layout.addWidget(self.fetch_button)
+        button_layout.addWidget(self.fetch_button)
+
+        self.add_local_button = QPushButton("Add Local Sketch", self)
+        self.add_local_button.clicked.connect(self.add_local_sketch)
+        button_layout.addWidget(self.add_local_button)
 
         self.compile_button = QPushButton("Compile Selected Sketch", self)
         self.compile_button.clicked.connect(self.compile_sketch)
-        self.layout.addWidget(self.compile_button)
+        button_layout.addWidget(self.compile_button)
+
+        self.layout.addLayout(button_layout)
 
         # Status label
         self.status_label = QLabel("", self)
@@ -161,7 +168,6 @@ class ArduboyManager(QMainWindow):
     def resource_path(self, relative_path):
         """Get the absolute path to a resource, works for development and for PyInstaller."""
         try:
-            # PyInstaller creates a temp folder and stores path in _MEIPASS
             base_path = sys._MEIPASS
         except Exception:
             base_path = os.path.abspath(".")
@@ -232,28 +238,98 @@ class ArduboyManager(QMainWindow):
             f"-DUSB_PID=0x8036"   # Default PID
         )
 
+    def add_local_sketch(self):
+        """Open a file dialog to select a local .ino sketch and add it to the list."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Sketch", "", "Arduino Sketches (*.ino)"
+        )
+        if file_path:
+            sketch_path = Path(file_path)
+            sketch_data = {
+                'title': sketch_path.stem,
+                'local_path': str(sketch_path),
+                'type': 'local'
+            }
+            item = QListWidgetItem(sketch_data['title'])
+            item.setData(Qt.ItemDataRole.UserRole, sketch_data)
+            self.list_widget.addItem(item)
+
     def compile_sketch(self):
-        """Compile the selected sketch and automatically handle export."""
+        """Compile the selected sketch (either local or remote)."""
         selected_item = self.list_widget.currentItem()
         if not selected_item:
             QMessageBox.warning(self, "Error", "No sketch selected.")
             return
 
         sketch = selected_item.data(Qt.ItemDataRole.UserRole)
+        if sketch.get('type') == 'local':
+            self.compile_local_sketch(sketch)
+        else:
+            self.compile_remote_sketch(sketch)
+
+    def compile_local_sketch(self, sketch):
+        """Handle compilation for a local sketch."""
+        local_path = Path(sketch.get('local_path'))
+        if not local_path.exists():
+            QMessageBox.warning(self, "Error", "Local sketch file not found.")
+            return
+
+        parent_dir = local_path.parent
+        sketch_name = local_path.stem
+        temp_dir = None
+
+        # Check if the sketch is in a correctly named directory
+        if parent_dir.name != sketch_name:
+            temp_dir = Path("temp_local_compile")
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, onerror=self.handle_remove_readonly)
+            temp_dir.mkdir(exist_ok=True)
+            sketch_temp_dir = temp_dir / sketch_name
+            sketch_temp_dir.mkdir(exist_ok=True)
+
+            # Copy all files to temp directory
+            for file in parent_dir.iterdir():
+                if file.is_file():
+                    shutil.copy(file, sketch_temp_dir)
+
+            # Rename .ino file to match directory
+            new_ino_path = sketch_temp_dir / f"{sketch_name}.ino"
+            original_ino = sketch_temp_dir / local_path.name
+            if original_ino.exists():
+                original_ino.rename(new_ino_path)
+            else:
+                QMessageBox.warning(self, "Error", "Sketch file missing in temp directory.")
+                return
+            compile_path = sketch_temp_dir
+            sketch_path = new_ino_path
+        else:
+            compile_path = parent_dir
+            sketch_path = local_path
+
+        self.status_label.setText("Compiling...")
+        build_path = compile_path / "build"
+        build_path.mkdir(exist_ok=True)
+        build_flags = self.get_build_flags()
+
+        # Start compilation thread with cleanup for temp directory
+        self.compile_thread = CompileThread(sketch_path, build_flags, build_path, compile_path)
+        self.compile_thread.finished.connect(
+            lambda success, msg: self.handle_compile_finished(success, msg, temp_dir)
+        )
+        self.compile_thread.start()
+
+    def compile_remote_sketch(self, sketch):
+        """Handle compilation for a remote (cloned) sketch."""
         source_url = sketch.get("sourceUrl")
         if not source_url:
             QMessageBox.warning(self, "Error", "No source URL found for this sketch.")
             return
 
-        # Show "Cloning..." message immediately
         self.status_label.setText("Cloning...")
-
-        # Clone and compile the sketch
         clone_path = Path("temp_clone")
         if clone_path.exists():
             shutil.rmtree(clone_path, onerror=self.handle_remove_readonly)
 
-        # Start the cloning thread
         self.clone_thread = CloneThread(source_url, clone_path)
         self.clone_thread.finished.connect(self.handle_clone_finished)
         self.clone_thread.start()
@@ -262,43 +338,38 @@ class ArduboyManager(QMainWindow):
         """Handle the result of the cloning thread."""
         if not success:
             QMessageBox.warning(self, "Error", message)
-            self.status_label.setText("")  # Clear the status message
+            self.status_label.setText("")
             return
 
-        # Show "Compiling..." message
         self.status_label.setText("Compiling...")
-
-        # Search for the sketch file in subdirectories
         sketch_path = self.find_sketch_file(Path("temp_clone"))
         if not sketch_path:
             QMessageBox.warning(self, "Error", "No sketch file found in the repository.")
-            self.status_label.setText("")  # Clear the status message
+            self.status_label.setText("")
             return
 
-        # Rename the sketch file to match its parent folder if necessary
         sketch_path = self.rename_sketch_file(sketch_path)
-
-        # Compile in the sketch's directory
-        compile_path = sketch_path.parent  # Set compile_path to the folder containing the .ino file
+        compile_path = sketch_path.parent
         build_path = compile_path / "build"
         build_path.mkdir(exist_ok=True)
-
-        # Generate build flags
         build_flags = self.get_build_flags()
 
-        # Start the compilation thread
         self.compile_thread = CompileThread(sketch_path, build_flags, build_path, compile_path)
-        self.compile_thread.finished.connect(self.handle_compile_finished)
+        self.compile_thread.finished.connect(
+            lambda success, msg: self.handle_compile_finished(success, msg, Path("temp_clone"))
+        )
         self.compile_thread.start()
 
-    def handle_compile_finished(self, success, message):
-        """Handle the result of the compilation thread."""
+    def handle_compile_finished(self, success, message, temp_dir=None):
+        """Handle compilation completion with optional temp directory cleanup."""
         if success:
             compiled_binary = Path(message)
             self.export_binary(compiled_binary)
         else:
             QMessageBox.warning(self, "Error", message)
-        self.status_label.setText("")  # Clear the status message
+        self.status_label.setText("")
+        if temp_dir and temp_dir.exists():
+            shutil.rmtree(temp_dir, onerror=self.handle_remove_readonly)
 
     def export_binary(self, compiled_binary):
         """Export the compiled binary."""
@@ -306,13 +377,9 @@ class ArduboyManager(QMainWindow):
             QMessageBox.warning(self, "Error", f"Compiled binary not found: {compiled_binary}")
             return
 
-        # Default filename: [SketchName].hex
         default_name = f"{compiled_binary.parent.parent.name}.hex"
         file_path, _ = QFileDialog.getSaveFileName(
-            self, 
-            "Save Binary", 
-            default_name,  # Set default name
-            "Hex Files (*.hex)"
+            self, "Save Binary", default_name, "Hex Files (*.hex)"
         )
     
         if file_path:
@@ -322,41 +389,27 @@ class ArduboyManager(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to save binary: {e}")
 
-    def clone_repository(self, repo_url, clone_path):
-        """Clone a repository."""
-        try:
-            subprocess.run(["git", "clone", repo_url, str(clone_path)], check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error cloning repository: {e}")
-            return False
-
     def handle_remove_readonly(self, func, path, exc_info):
         """Handle read-only files during directory removal."""
         if func in (os.rmdir, os.remove, os.unlink) and exc_info[1].errno == errno.EACCES:
-            os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)  # Make the file writable
-            func(path)  # Retry the operation
+            os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+            func(path)
         else:
-            raise exc_info[1]  # Re-raise other errors
+            raise exc_info[1]
 
     def find_sketch_file(self, directory):
         """Search for a sketch file containing setup() and loop()."""
-        print(f"Searching for sketch in: {directory}")  # Debug print
         for root, _, files in os.walk(directory):
             for file in files:
                 if file.endswith(".ino"):
                     sketch_path = Path(root) / file
-                    print(f"Checking file: {sketch_path}")  # Debug print
                     try:
                         with open(sketch_path, "r", encoding="utf-8") as f:
-                            content = f.read().lower()  # Case-insensitive search
-                            # Look for "setup(" and "loop(" instead of "setup()" and "loop()"
+                            content = f.read().lower()
                             if "setup(" in content and "loop(" in content:
-                                print(f"Found sketch: {sketch_path}")  # Debug print
                                 return sketch_path
                     except Exception as e:
-                        print(f"Error reading {sketch_path}: {e}")  # Debug print
-        print("No sketch file found.")  # Debug print
+                        print(f"Error reading {sketch_path}: {e}")
         return None
 
     def rename_sketch_file(self, sketch_path):
