@@ -6,38 +6,143 @@ import subprocess
 import shutil
 import stat
 import errno
+import csv
+from io import StringIO
 from pathlib import Path
+from bs4 import BeautifulSoup
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog, QMessageBox
 )
-from PyQt6.QtGui import QPixmap, QIcon
+from PyQt6.QtGui import QPixmap, QIcon, QFont, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 # Configuration
 REPO_JSON_URL = "https://arduboy.ried.cl/repo.json"
-ARDUINO_CLI = "arduino-cli"  # Ensure it's in your system's PATH
+BIGFX_REPO_URL = "https://www.bloggingadeadhorse.com/cart/Cart_GetList.php?listId=1&filename=full"
+BIGFX_BASE_URL = "https://www.bloggingadeadhorse.com/cart/"
+
+ARDUINO_CLI = "arduino-cli"
 ARDUINO_BOARD = "arduboy-homemade:avr:arduboy-homemade"
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+}
 
 class FetchThread(QThread):
-    """Thread to fetch the repo.json file."""
+    """Thread to fetch sketches from multiple sources."""
     fetched = pyqtSignal(list)
 
     def run(self):
+        all_items = []
+        
+        # Fetch main repository
         try:
-            response = requests.get(REPO_JSON_URL, timeout=10)
+            response = requests.get(REPO_JSON_URL, headers=HEADERS, timeout=15)
             response.raise_for_status()
             data = response.json()
-            if "items" not in data or not isinstance(data["items"], list):
-                raise ValueError("Invalid repo.json format.")
-            self.fetched.emit(data["items"])
+            if "items" in data and isinstance(data["items"], list):
+                all_items.extend(data["items"])
         except Exception as e:
-            print(f"Error fetching repo.json: {e}")
-            self.fetched.emit([])
+            print(f"Error fetching main repo: {e}")
+
+        # Fetch and parse BigFX CSV data
+        try:
+            response = requests.get(BIGFX_REPO_URL, headers=HEADERS, timeout=15)
+            response.raise_for_status()
+            
+            # Parse CSV data
+            csv_data = csv.DictReader(StringIO(response.text), delimiter=';')
+            for row in csv_data:
+                # Skip entries without valid source code
+                source = row.get('Source', '').strip().lower()
+                if not source or source in {'na', 'n/a', 'none', ''}:
+                    continue
+                
+                try:
+                    transformed = {
+                        "title": row.get('Title', 'Untitled').strip(),
+                        "sourceUrl": self.clean_git_url(source),
+                        "thumbnailUrl": row.get('Image', '').strip(),
+                        "description": row.get('Description', '').strip(),
+                        "type": "bigfx"
+                    }
+                    if transformed["sourceUrl"]:
+                        all_items.append(transformed)
+                except Exception as e:
+                    print(f"Error processing row {row}: {e}")
+
+        except Exception as e:
+            print(f"Error processing BigFX data: {e}")
+
+        # Remove duplicates based on normalized sourceUrl
+        unique_sketches = {}
+        for sketch in all_items:
+            source_url = self.normalize_url(sketch.get("sourceUrl"))
+            if source_url:
+                unique_sketches[source_url] = sketch
+
+        self.fetched.emit(list(unique_sketches.values()))
+
+    def normalize_url(self, url):
+        """Normalize Git URLs to prevent duplicates."""
+        if not url:
+            return None
+        return url.lower().replace(".git", "").strip()
+
+    def clean_git_url(self, url):
+        """Validate and clean Git URLs."""
+        from urllib.parse import urlparse
+        
+        # Clean up URL formatting
+        url = url.strip()
+        if not url:
+            return ""
+            
+        parsed = urlparse(url)
+        
+        # Add scheme if missing
+        if not parsed.scheme:
+            url = f"https://{url}"
+            parsed = urlparse(url)  # Re-parse with scheme
+        
+        # Handle GitHub URLs
+        if "github.com" in parsed.netloc:
+            # Convert tree URLs to raw repo URLs
+            if "/tree/" in parsed.path:
+                path_parts = parsed.path.split("/tree/")
+                return f"{parsed.scheme}://{parsed.netloc}{path_parts[0]}.git"
+            
+            # Add .git extension if missing
+            if not parsed.path.endswith(".git"):
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}.git"
+        
+        return url
+    def transform_bigfx_data(self, bigfx_data):
+        """Transform BigFX data to match standard repo format."""
+        transformed = []
+        for row in bigfx_data:
+            try:
+                # Convert relative thumbnail URLs to absolute
+                thumbnail = row.get('Image', '').strip()
+                if thumbnail and not thumbnail.startswith(('http:', 'https:')):
+                    thumbnail = f"{BIGFX_BASE_URL}{thumbnail}"
+
+                transformed.append({
+                    "title": row.get('Title', 'Untitled').strip(),
+                    "sourceUrl": self.clean_git_url(row['Source'].strip()),
+                    "thumbnailUrl": thumbnail,
+                    "description": row.get('Description', '').strip(),
+                    "type": "bigfx"
+                })
+            except KeyError as e:
+                print(f"Missing key in row: {e}")
+                continue
+        return transformed 
 
 class CloneThread(QThread):
     """Thread to handle repository cloning."""
-    finished = pyqtSignal(bool, str)  # Signal to indicate cloning status and message
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, repo_url, clone_path):
         super().__init__()
@@ -53,7 +158,7 @@ class CloneThread(QThread):
 
 class CompileThread(QThread):
     """Thread to handle sketch compilation."""
-    finished = pyqtSignal(bool, str)  # Signal to indicate compilation status and message
+    finished = pyqtSignal(bool, str)
 
     def __init__(self, sketch_path, build_flags, build_path, compile_path):
         super().__init__()
@@ -65,133 +170,219 @@ class CompileThread(QThread):
     def run(self):
         try:
             result = subprocess.run(
-                [ARDUINO_CLI, "compile", "--fqbn", ARDUINO_BOARD, "--build-path", str(self.build_path), *self.build_flags, str(self.compile_path)],
+                [ARDUINO_CLI, "compile", "--fqbn", ARDUINO_BOARD, 
+                 "--build-path", str(self.build_path), *self.build_flags, 
+                 str(self.compile_path)],
                 check=True,
                 capture_output=True,
                 text=True
             )
 
-            # Locate the compiled binary (matches Arduino IDE naming)
+            # Locate compiled binary
             sketch_name = self.compile_path.name
             compiled_binary = self.build_path / f"{sketch_name}.ino.hex"
             if not compiled_binary.exists():
                 hex_files = list(self.build_path.glob("*.hex"))
-                if hex_files:
-                    compiled_binary = hex_files[0]
-                else:
-                    self.finished.emit(False, "No .hex file found in build directory.")
-                    return
+                compiled_binary = hex_files[0] if hex_files else None
 
-            self.finished.emit(True, str(compiled_binary))
+            if compiled_binary:
+                self.finished.emit(True, str(compiled_binary))
+            else:
+                self.finished.emit(False, "No .hex file found in build directory.")
         except subprocess.CalledProcessError as e:
-            self.finished.emit(False, f"Failed to compile sketch: {e}\nOutput:\n{e.stdout}\nError:\n{e.stderr}")
+            error_msg = f"Failed to compile sketch: {e}\nOutput:\n{e.stdout}\nError:\n{e.stderr}"
+            self.finished.emit(False, error_msg)
 
 class ArduboyManager(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Arduboy ReComp")
         self.setGeometry(100, 100, 800, 600)
+        self.setWindowIcon(QIcon(self.resource_path("arduboy_icon.ico")))
 
-        # Set window icon
-        icon_path = self.resource_path("arduboy_icon.ico")
-        self.setWindowIcon(QIcon(icon_path))
-
-        # Main layout
+        # Main UI components
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
 
-        # Search bar
-        self.search_bar = QLineEdit(self)
+        # Search and list widgets
+        self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search sketches...")
         self.search_bar.textChanged.connect(self.filter_sketches)
         self.layout.addWidget(self.search_bar)
 
-        # List widget
-        self.list_widget = QListWidget(self)
+        self.list_widget = QListWidget()
         self.list_widget.setIconSize(QPixmap(100, 100).size())
         self.layout.addWidget(self.list_widget)
 
         # Settings panel
         self.settings_panel = QVBoxLayout()
-
-        # Variant
-        self.variant_combo = QComboBox(self)
-        self.variant_combo.addItems([
-            "Arduino Leonardo",
-            "Arduino/Genuino Micro",
-            "Pro Micro 5V Standard Wiring",
-            "Arduino Pro Micro Alternate Wiring"
-        ])
-        self.settings_panel.addWidget(QLabel("Variant:"))
-        self.settings_panel.addWidget(self.variant_combo)
-
-        # Display
-        self.display_combo = QComboBox(self)
-        self.display_combo.addItems(["SH1106", "SSD1306", "SSD1309"])
-        self.settings_panel.addWidget(QLabel("Display:"))
-        self.settings_panel.addWidget(self.display_combo)
-
-        # Flash Chip
-        self.flash_combo = QComboBox(self)
-        self.flash_combo.addItems(["Pin2/D1/SDA", "Pin0/D0/Rx"])
-        self.settings_panel.addWidget(QLabel("Flash Chip:"))
-        self.settings_panel.addWidget(self.flash_combo)
-
+        self.add_settings_combos()
         self.layout.addLayout(self.settings_panel)
 
         # Buttons
         button_layout = QHBoxLayout()
-        self.fetch_button = QPushButton("Fetch Sketches", self)
-        self.fetch_button.clicked.connect(self.fetch_sketches)
+        self.fetch_button = QPushButton("Fetch Sketches")
+        self.add_local_button = QPushButton("Add Local Sketch")
+        self.compile_button = QPushButton("Compile Selected Sketch")
         button_layout.addWidget(self.fetch_button)
-
-        self.add_local_button = QPushButton("Add Local Sketch", self)
-        self.add_local_button.clicked.connect(self.add_local_sketch)
         button_layout.addWidget(self.add_local_button)
-
-        self.compile_button = QPushButton("Compile Selected Sketch", self)
-        self.compile_button.clicked.connect(self.compile_sketch)
         button_layout.addWidget(self.compile_button)
-
         self.layout.addLayout(button_layout)
 
         # Status label
-        self.status_label = QLabel("", self)
+        self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("font-weight: bold; color: blue;")
         self.layout.addWidget(self.status_label)
 
+        # Connections
+        self.fetch_button.clicked.connect(self.fetch_sketches)
+        self.add_local_button.clicked.connect(self.add_local_sketch)
+        self.compile_button.clicked.connect(self.compile_sketch)
+
         # Data
         self.sketches = []
 
+    
+    def add_section_header(self, text):
+        """Add a styled section header to the list widget."""
+        header = QListWidgetItem(text)
+        header.setFlags(Qt.ItemFlag.NoItemFlags)  # Make non-selectable
+        font = QFont()
+        font.setBold(True)
+        header.setFont(font)
+        header.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        header.setBackground(QColor(240, 240, 240))  # Light gray background
+        self.list_widget.addItem(header)
+
+    def add_settings_combos(self):
+        """Add settings combo boxes with consistent naming."""
+        settings = {
+            "Variant": [
+                "Arduino Leonardo",
+                "Arduino/Genuino Micro",
+                "Pro Micro 5V Standard Wiring",
+                "Arduino Pro Micro Alternate Wiring"
+            ],
+            "Display": ["SH1106", "SSD1306", "SSD1309"],
+            "Flash Chip": ["Pin2/D1/SDA", "Pin0/D0/Rx"]  # This key defines the attribute name
+        }
+
+        for name, options in settings.items():
+            combo = QComboBox()
+            combo.addItems(options)
+            self.settings_panel.addWidget(QLabel(f"{name}:"))
+            self.settings_panel.addWidget(combo)
+            # Convert to snake_case for the attribute name
+            attr_name = name.lower().replace(' ', '_') + '_combo'
+            setattr(self, attr_name, combo)
+
     def resource_path(self, relative_path):
-        """Get the absolute path to a resource, works for development and for PyInstaller."""
+        """Get absolute path to resource."""
         try:
             base_path = sys._MEIPASS
         except Exception:
             base_path = os.path.abspath(".")
-
         return os.path.join(base_path, relative_path)
 
     def fetch_sketches(self):
-        """Fetch sketches from the repo.json file."""
+        """Start fetching sketches from all sources."""
         self.fetch_thread = FetchThread()
         self.fetch_thread.fetched.connect(self.populate_list)
         self.fetch_thread.start()
 
-    def populate_list(self, sketches):
-        """Populate the list widget with fetched sketches."""
-        self.sketches = sketches
+    
+    def populate_list(self, new_sketches):
+        """Rebuild the list with categorized sections."""
+        # Clear existing items
         self.list_widget.clear()
-        for sketch in sketches:
-            item = QListWidgetItem(sketch.get("title", "Untitled"))
-            item.setData(Qt.ItemDataRole.UserRole, sketch)
-            if "thumbnailUrl" in sketch:
-                thumbnail = QPixmap()
-                thumbnail.loadFromData(requests.get(sketch["thumbnailUrl"]).content)
-                item.setIcon(QIcon(thumbnail))
-            self.list_widget.addItem(item)
+
+        # Categorize sketches
+        eried_sketches = []
+        cart_builder_sketches = []
+        local_sketches = []
+
+        # Separate new sketches
+        for sketch in new_sketches:
+            if sketch.get('type') == 'bigfx':
+                cart_builder_sketches.append(sketch)
+            else:
+                eried_sketches.append(sketch)
+
+        # Get existing local sketches
+        local_sketches = [
+            self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.list_widget.count())
+            if self.list_widget.item(i).data(Qt.ItemDataRole.UserRole).get("type") == "local"
+        ]
+
+        # Add Eried's Repo section
+        if eried_sketches:
+            self.add_section_header("Eried's Repo:")
+            for sketch in eried_sketches:
+                self.add_sketch_item(sketch)
+
+        # Add Cart Builder section
+        if cart_builder_sketches:
+            self.add_section_header("Cart Builder:")
+            for sketch in cart_builder_sketches:
+                self.add_sketch_item(sketch)
+
+        # Add Local Sketches section
+        if local_sketches:
+            self.add_section_header("Local Sketches:")
+            for sketch in local_sketches:
+                self.add_sketch_item(sketch)
+
+    def add_sketch_item(self, sketch):
+        """Add individual sketch item to list with proper styling."""
+        item = QListWidgetItem(sketch.get("title", "Untitled"))
+        item.setData(Qt.ItemDataRole.UserRole, sketch)
+        
+        # Style differently for local sketches
+        if sketch.get('type') == 'local':
+            item.setForeground(QColor(0, 128, 0))  # Green text
+            font = QFont()
+            font.setItalic(True)
+            item.setFont(font)
+        
+        if "thumbnailUrl" in sketch:
+            self.load_thumbnail(item, sketch["thumbnailUrl"])
+            
+        self.list_widget.addItem(item)
+
+    def load_thumbnail(self, item, url):
+        """Load thumbnail image asynchronously with validation."""
+        if not url or not url.startswith(('http:', 'https:')):
+            return  # Skip invalid URLs
+            
+        def set_thumbnail(data):
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            item.setIcon(QIcon(pixmap))
+            
+        try:
+            thread = requests.get(url, stream=True)
+            thread.onload = lambda: set_thumbnail(thread.content)
+            thread.start()
+        except requests.exceptions.RequestException as e:
+            print(f"Error loading thumbnail: {e}")
+
+    def filter_sketches(self):
+        """Filter list based on search text."""
+        search_text = self.search_bar.text().lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            sketch = item.data(Qt.ItemDataRole.UserRole)
+            text_matches = any(
+                search_text in (sketch.get(field, "") or "").lower()
+                for field in ["title", "description"]
+            )
+            item.setHidden(not text_matches)
+
+    # ... [Keep existing methods for get_build_flags, add_local_sketch, 
+    # compile_sketch, handle compilation, etc. from previous version] ...
 
     def filter_sketches(self):
         """Filter sketches based on search text."""
@@ -206,7 +397,7 @@ class ArduboyManager(QMainWindow):
         """Generate build flags based on selected settings."""
         variant = self.variant_combo.currentText()
         display = self.display_combo.currentText()
-        flash = self.flash_combo.currentText()
+        flash_chip = self.flash_chip_combo.currentText()  # Corrected attribute name
 
         # Map variant to correct flags
         variant_flags = {
@@ -227,7 +418,7 @@ class ArduboyManager(QMainWindow):
         flash_flags = {
             "Pin2/D1/SDA": "-DCART_CS_SDA",
             "Pin0/D0/Rx": "-DCART_CS_RX"
-        }.get(flash, "-DCART_CS_SDA")
+        }.get(flash_chip, "-DCART_CS_SDA")  # Changed variable name here
 
         return (
             "--build-property", "build.extra_flags="
@@ -426,6 +617,7 @@ class ArduboyManager(QMainWindow):
                 print(f"Error renaming sketch file: {e}")
                 return sketch_path
         return sketch_path
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
