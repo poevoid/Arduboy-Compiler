@@ -370,19 +370,24 @@ class ArduboyManager(QMainWindow):
             print(f"Error loading thumbnail: {e}")
 
     def filter_sketches(self):
-        """Filter list based on search text."""
+        """Filter sketches based on search text."""
         search_text = self.search_bar.text().lower()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             sketch = item.data(Qt.ItemDataRole.UserRole)
-            text_matches = any(
-                search_text in (sketch.get(field, "") or "").lower()
-                for field in ["title", "description"]
-            )
-            item.setHidden(not text_matches)
+        
+            # Skip section headers and invalid items
+            if sketch is None:
+                continue
+        
+            # Get title and description safely
+            title = sketch.get("title", "").lower()
+            description = sketch.get("description", "").lower()
+        
+            # Check for match
+            match = search_text in title or search_text in description
+            item.setHidden(not match)
 
-    # ... [Keep existing methods for get_build_flags, add_local_sketch, 
-    # compile_sketch, handle compilation, etc. from previous version] ...
 
     def filter_sketches(self):
         """Filter sketches based on search text."""
